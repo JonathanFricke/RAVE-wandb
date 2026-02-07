@@ -415,13 +415,8 @@ def main(argv):
 
     wandb_logger.watch(model, log="all")
 
-    tb_logger = pl.loggers.TensorBoardLogger(
-                    FLAGS.out_path,
-                    name=RUN_NAME,
-                )
-
     trainer = pl.Trainer(
-        logger=[tb_logger, wandb_logger],
+        logger=[wandb_logger],
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,

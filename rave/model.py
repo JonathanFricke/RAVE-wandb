@@ -495,17 +495,14 @@ class RAVE(pl.LightningModule):
         self.eval_number += 1
 
     def on_fit_start(self):
-        tb = self.logger.experiment
 
         config = gin.operative_config_str()
         config = config.split('\n')
         config = ['```'] + config + ['```']
         config = '\n'.join(config)
-        tb.add_text("config", config)
 
         model = str(self)
         model = model.split('\n')
         model = ['```'] + model + ['```']
         model = '\n'.join(model)
-        tb.add_text("model", model)
 
