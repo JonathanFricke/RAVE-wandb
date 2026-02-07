@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 import gin
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.utilities import rank_zero_only
 import torch
 from absl import flags, app
 from torch.utils.data import DataLoader
@@ -21,6 +23,15 @@ import rave.core
 import rave.dataset
 from rave.transforms import get_augmentations, add_augmentation
 
+import wandb
+
+import librosa
+import matplotlib
+matplotlib.use('Agg') # Force headless backend
+import matplotlib.pyplot as plt
+import numpy as np
+
+project = "RAVE_Initial"
 
 FLAGS = flags.FLAGS
 
@@ -76,6 +87,136 @@ flags.DEFINE_bool('progress',
 flags.DEFINE_bool('smoke_test', 
                   default=False,
                   help="Run training with n_batches=1 to test the model")
+flags.DEFINE_string('precision',
+                       '32', "Automatic lowered precision")
+
+
+
+class WandbAudioCallback(pl.Callback):
+    def __init__(self, num_samples=2, sample_rate=44100):
+        super().__init__()
+        self.num_samples = num_samples
+        self.sample_rate = sample_rate
+        self.gt_logged = False
+
+    def _create_spectrogram(self, audio):
+        S = librosa.feature.melspectrogram(y=audio, sr=self.sample_rate, n_mels=128)
+        REF_POWER = 1e-6
+        S_dB = librosa.power_to_db(S, ref=1.0, top_db=None)
+        
+        fig, ax = plt.subplots(figsize=(10, 4))
+        img = librosa.display.specshow(S_dB, x_axis='time', y_axis='mel', 
+                                    sr=self.sample_rate, ax=ax,
+                                    vmin=-80, vmax=40, cmap="magma")
+        plt.colorbar(img, ax=ax, format='%+2.0f dB')
+        
+        # Robust way to convert canvas to numpy array
+        fig.canvas.draw()
+        rgba_buffer = fig.canvas.buffer_rgba()
+        data = np.asarray(rgba_buffer)[:, :, :3] # Drop Alpha channel
+        plt.close(fig)
+        return data
+
+    @rank_zero_only
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        # Only log for the first batch of the validation set to save time/memory
+        if batch_idx == 0:
+            # 1. Get a small subset of the validation batch
+            # RAVE usually expects (B, C, T)
+            x = batch[:self.num_samples].to(pl_module.device)
+
+            with torch.no_grad():
+                # 2. Generate reconstruction
+                # In RAVE, the forward pass usually returns the reconstruction
+                x_hat = pl_module(x)
+
+            # Handle RAVE derivative training
+            if hasattr(pl_module, 'integrator') and pl_module.integrator is not None:
+                x = pl_module.integrator(x)
+                x_hat = pl_module.integrator(x_hat)
+            
+            # 3. Find the WandbLogger in the list of loggers
+            wandb_logger = None
+            for logger in trainer.loggers:
+                if isinstance(logger, WandbLogger):
+                    wandb_logger = logger
+                    break
+            
+            if wandb_logger:
+                # 4. Prepare and log audio
+                # Wandb.Audio expects a numpy array (T,) or (T, C)
+                # We need to move to CPU and handle the shape
+                logs = {}
+                for i in range(x_hat.shape[0]):
+                    # Process Ground Truth
+                    if not self.gt_logged:
+                        gt_signal = x[i].detach().cpu().numpy().T
+                        logs[f"val/sample_{i}_original"] = wandb.Audio(
+                            gt_signal, 
+                            sample_rate=self.sample_rate,
+                            caption=f"Original {i}"
+                        )
+                        logs[f"val/sample_{i}_original_spec"] = wandb.Image(self._create_spectrogram(gt_signal[:, 0]))
+                    
+                    # Process Reconstruction
+                    rec_signal = x_hat[i].detach().cpu().numpy().T
+                    logs[f"val/sample_{i}_reconstructed"] = wandb.Audio(
+                        rec_signal, 
+                        sample_rate=self.sample_rate,
+                        caption=f"Reconstructed {i}"
+                    )
+                    logs[f"val/sample_{i}_recon_spec"] = wandb.Image(self._create_spectrogram(rec_signal[:, 0]))
+                
+                wandb_logger.experiment.log(logs, step=trainer.global_step)
+                self.gt_logged = True
+
+class LearningRateMonitor(pl.Callback):
+    """Monitor learning rates and other optimizer/training parameters"""
+    
+    @rank_zero_only
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Log learning rate and other optimizer params after each batch"""
+        # Find the WandbLogger
+        wandb_logger = None
+        for logger in trainer.loggers:
+            if isinstance(logger, WandbLogger):
+                wandb_logger = logger
+                break
+        
+        if wandb_logger:
+            logs = {}
+            
+            # Log learning rates for all optimizers
+            optimizers = trainer.optimizers
+            if not isinstance(optimizers, list):
+                optimizers = [optimizers]
+            
+            for idx, optimizer in enumerate(optimizers):
+                # Get the actual optimizer if it's wrapped in a dict
+                if isinstance(optimizer, dict):
+                    optimizer = optimizer['optimizer']
+                
+                # Log learning rate for each param group
+                for group_idx, param_group in enumerate(optimizer.param_groups):
+                    lr = param_group['lr']
+                    opt_name = f"opt_{idx}" if len(optimizers) > 1 else "opt"
+                    logs[f"lr/{opt_name}_group_{group_idx}"] = lr
+            
+            # Log trainer state
+            logs["trainer/global_step"] = trainer.global_step
+            logs["trainer/epoch"] = trainer.current_epoch
+            
+            # Log model-specific training state
+            if hasattr(pl_module, 'warmed_up'):
+                logs["model/warmed_up"] = int(pl_module.warmed_up)
+            
+            if hasattr(pl_module, 'beta_factor'):
+                logs["model/beta_factor"] = pl_module.beta_factor
+            
+            if hasattr(pl_module, 'update_discriminator_every'):
+                logs["model/update_discriminator_every"] = pl_module.update_discriminator_every
+            
+            wandb_logger.experiment.log(logs, step=trainer.global_step)
 
 
 class EMA(pl.Callback):
@@ -143,12 +284,22 @@ def main(argv):
     augmentations = parse_augmentations(map(add_gin_extension, FLAGS.augment))
     gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
 
+    gin_hash = hashlib.md5(
+    gin.operative_config_str().encode()).hexdigest()[:10]
+
+    RUN_NAME = f'{FLAGS.name}_{gin_hash}'
+
     # parse configuration
     if FLAGS.ckpt:
         config_file = rave.core.search_for_config(FLAGS.ckpt)
         if config_file is None:
             print('Config file not found in %s'%FLAGS.run)
         gin.parse_config_file(config_file)
+
+        # # Query wandb for the run associated with the checkpoint
+        # wandb_run = get_wandb_run_from_ckpt(FLAGS.ckpt)
+        # if wandb_run:
+        #     print(f"Associated wandb run: {wandb_run.name}")
     else:
         gin.parse_config_files_and_bindings(
             map(add_gin_extension, FLAGS.config),
@@ -182,10 +333,21 @@ def main(argv):
     val = DataLoader(val, FLAGS.batch, False, num_workers=num_workers)
 
     # CHECKPOINT CALLBACKS
-    validation_checkpoint = pl.callbacks.ModelCheckpoint(monitor="validation",
-                                                         filename="best")
-    last_filename = "last" if FLAGS.save_every is None else "epoch-{epoch:04d}"                                                        
-    last_checkpoint = rave.core.ModelCheckpoint(filename=last_filename, step_period=FLAGS.save_every)
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(FLAGS.out_path, RUN_NAME),
+        monitor="validation",
+        filename="rave-{epoch:02d}-{step:d}",
+        save_top_k=1,             # Only keeps the best model
+        save_last=True,           # Automatically creates a 'last.ckpt'
+        every_n_train_steps=FLAGS.save_every, # Replaces the RAVE periodic save
+    )
+                                                      
+    last_checkpoint = rave.core.ModelCheckpoint(filename="last", step_period=FLAGS.save_every)
+    
+    # validation_checkpoint = pl.callbacks.ModelCheckpoint(monitor="validation",
+    #                                                      filename="best")
+    # last_filename = "last" if FLAGS.save_every is None else "epoch-{epoch:04d}"                                                        
+    # last_checkpoint = rave.core.ModelCheckpoint(filename=last_filename, step_period=FLAGS.save_every)
 
     val_check = {}
     if len(train) >= FLAGS.val_every:
@@ -198,10 +360,7 @@ def main(argv):
         val_check['limit_train_batches'] = 1
         val_check['limit_val_batches'] = 1
 
-    gin_hash = hashlib.md5(
-        gin.operative_config_str().encode()).hexdigest()[:10]
 
-    RUN_NAME = f'{FLAGS.name}_{gin_hash}'
 
     os.makedirs(os.path.join(FLAGS.out_path, RUN_NAME), exist_ok=True)
 
@@ -227,23 +386,42 @@ def main(argv):
         accelerator = "mps"
         devices = 1
 
+    sample_rate = model.sr if hasattr(model, 'sr') else 44100
+
     callbacks = [
-        validation_checkpoint,
+        checkpoint_callback,
         last_checkpoint,
+        # validation_checkpoint,
+        # last_checkpoint,
         rave.model.WarmupCallback(),
         rave.model.QuantizeCallback(),
         # rave.core.LoggerCallback(rave.core.ProgressLogger(RUN_NAME)),
         rave.model.BetaWarmupCallback(),
+        WandbAudioCallback(num_samples=2, sample_rate=sample_rate),
+        LearningRateMonitor()
     ]
 
     if FLAGS.ema is not None:
         callbacks.append(EMA(FLAGS.ema))
 
+
+    wandb_logger = WandbLogger(
+        project=project,
+        name=RUN_NAME,
+        save_dir=FLAGS.out_path,
+        config=FLAGS.flag_values_dict(),
+        log_model=True,
+    )
+
+    wandb_logger.watch(model, log="all")
+
+    tb_logger = pl.loggers.TensorBoardLogger(
+                    FLAGS.out_path,
+                    name=RUN_NAME,
+                )
+
     trainer = pl.Trainer(
-        logger=pl.loggers.TensorBoardLogger(
-            FLAGS.out_path,
-            name=RUN_NAME,
-        ),
+        logger=[tb_logger, wandb_logger],
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,
@@ -251,6 +429,7 @@ def main(argv):
         max_steps=FLAGS.max_steps,
         profiler="simple",
         enable_progress_bar=FLAGS.progress,
+        precision=FLAGS.precision,
         **val_check,
     )
 

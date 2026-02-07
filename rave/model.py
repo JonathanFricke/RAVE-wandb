@@ -228,8 +228,8 @@ class RAVE(pl.LightningModule):
         gen_p += list(self.decoder.parameters())
         dis_p = list(self.discriminator.parameters())
 
-        gen_opt = torch.optim.Adam(gen_p, 1e-3, (.5, .9))
-        dis_opt = torch.optim.Adam(dis_p, 1e-4, (.5, .9))
+        gen_opt = torch.optim.Adam(gen_p, 2e-3, (.5, .9))
+        dis_opt = torch.optim.Adam(dis_p, 2e-4, (.5, .9))
 
         return ({'optimizer': gen_opt,
                  'lr_scheduler': {'scheduler': torch.optim.lr_scheduler.LinearLR(gen_opt, start_factor=1.0, end_factor=0.1, total_iters=self.warmup)}},
